@@ -1,9 +1,9 @@
 streamlit
 streamlit-webrtc
-opencv-python
+opencv-python-headless==4.10.0.84
 mediapipe==0.10.21
-numpy
+numpy==1.26.4
 joblib
 scikit-learn
 av
-protobuf
+protobuf==4.25.9
