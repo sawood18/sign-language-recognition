@@ -1,18 +1,9 @@
-
-#=============================================
-# SIGNIFY - Sign Language Recognition
-# Install with:  pip install -r requirements.txt
-# =============================================
-
-# Core
-mediapipe==0.10.9
-opencv-python==4.10.0.84
+streamlit==1.35.0
+streamlit-webrtc==0.47.9
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.21
 numpy==1.26.4
 joblib==1.3.2
 scikit-learn==1.4.2
-pandas==2.2.2
-
-# Web app
-streamlit==1.35.0
-streamlit-webrtc==0.47.9
 av==12.1.0
+protobuf==4.25.9
