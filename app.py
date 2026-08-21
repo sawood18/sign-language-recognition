@@ -1,5 +1,6 @@
 # =============================================
 # app.py  —  SIGNIFY
+# Live camera with WebRTC + free TURN servers
 # Works on Streamlit Cloud + all devices
 # Run: streamlit run app.py
 # =============================================
@@ -14,7 +15,7 @@ import time
 import os
 import threading
 from collections import deque, Counter
-from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
 # =============================================
 # PAGE CONFIG
@@ -30,12 +31,13 @@ st.set_page_config(
 # CONSTANTS
 # =============================================
 
-MIN_CONFIDENCE  = 70.0   # model must be this % sure
-STABLE_FRAMES   = 8      # frames that must agree
-STABLE_MAJORITY = 6      # how many must match
-LETTER_DELAY    = 2.5    # seconds between letters
-MOTION_LEN      = 30     # frames for J/Z (must match training)
-MIN_HAND_DIST   = 0.04   # ignore tiny false-positive hands
+MIN_CONFIDENCE  = 70.0
+STABLE_FRAMES   = 10
+STABLE_MAJORITY = 7
+LETTER_DELAY    = 2.5
+MOTION_LEN      = 30
+MIN_HAND_DIST   = 0.04
+NO_HAND_RESET   = 5
 
 # =============================================
 # PATHS
@@ -53,9 +55,9 @@ MOTION_MODEL = os.path.join(BASE_DIR, "models", "motion_model.pkl")
 def load_models():
     errors = []
     if not os.path.exists(STATIC_MODEL):
-        errors.append(f"❌ sign_model.pkl not found → run `python train_model.py`")
+        errors.append(f"sign_model.pkl not found — run `python train_model.py`")
     if not os.path.exists(MOTION_MODEL):
-        errors.append(f"❌ motion_model.pkl not found → run `python train_model.py`")
+        errors.append(f"motion_model.pkl not found — run `python train_model.py`")
     if errors:
         return None, None, errors
     try:
@@ -68,7 +70,7 @@ def load_models():
 sign_model, motion_model, model_errors = load_models()
 
 # =============================================
-# MEDIAPIPE  (mp.solutions — needs mediapipe==0.10.9)
+# MEDIAPIPE  (requires mediapipe==0.10.9)
 # =============================================
 
 mp_hands = mp.solutions.hands
@@ -76,44 +78,46 @@ mp_draw  = mp.solutions.drawing_utils
 mp_style = mp.solutions.drawing_styles
 
 # =============================================
-# SESSION STATE  — persistent across reruns
+# FREE TURN SERVERS  — fixes blank camera on
+# Streamlit Cloud and all devices behind NAT
+# These are from open-relay.metered.ca (free)
 # =============================================
 
-def init_state():
-    defaults = {
-        "sentence":         "",
-        "last_sign":        "-",
-        "last_conf":        0.0,
-        "last_letter_time": 0.0,
-        "sign_locked":      False,
-        "history":          deque(maxlen=STABLE_FRAMES),
-        "motion_seq":       [],
-        "no_hand_count":    0,
-        "mode":             "camera",   # "camera" or "upload"
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-init_state()
+RTC_CONFIG = RTCConfiguration({
+    "iceServers": [
+        # Google STUN
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        # Metered free STUN
+        {"urls": ["stun:stun.relay.metered.ca:80"]},
+        # Metered free TURN (UDP port 80 — works through most firewalls)
+        {
+            "urls": ["turn:openrelay.metered.ca:80"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        # Metered free TURN (TCP port 443 — bypasses strict firewalls)
+        {
+            "urls": ["turn:openrelay.metered.ca:443"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        # Metered free TURN over TLS (most strict networks)
+        {
+            "urls": ["turns:openrelay.metered.ca:443"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+    ]
+})
 
 # =============================================
 # FEATURE EXTRACTION
-# Must be IDENTICAL to collect_data.py
+# Identical to collect_data.py and collect_motion.py
 # =============================================
 
-@st.cache_resource
-def get_hands_detector():
-    return mp_hands.Hands(
-        static_image_mode=True,    # True for per-image processing
-        max_num_hands=1,
-        model_complexity=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-    )
-
 def extract_static_features(hand_landmarks):
-    """63 normalised floats — same pipeline as collect_data.py"""
+    """Returns 63 normalised floats or None."""
     wrist = hand_landmarks.landmark[0]
     points = []
     for lm in hand_landmarks.landmark:
@@ -133,10 +137,10 @@ def extract_static_features(hand_landmarks):
         row.append(p[0] / max_dist)
         row.append(p[1] / max_dist)
         row.append(p[2] / max_dist)
-    return row   # 63 values
+    return row
 
 def extract_motion_row(hand_landmarks):
-    """63 wrist-relative floats — same pipeline as collect_motion.py"""
+    """Returns 63 wrist-relative floats."""
     wrist = hand_landmarks.landmark[0]
     row = []
     for lm in hand_landmarks.landmark:
@@ -145,34 +149,133 @@ def extract_motion_row(hand_landmarks):
             lm.y - wrist.y,
             lm.z - wrist.z,
         ])
-    return row   # 63 values
+    return row
 
-def process_frame(img_bgr, hands_detector):
-    """
-    Process one BGR frame.
-    Returns (annotated_img, sign, confidence, hand_found)
-    """
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    results = hands_detector.process(img_rgb)
+# =============================================
+# VIDEO PROCESSOR
+# =============================================
 
-    prediction = ""
-    confidence = 0.0
-    hand_found = False
+class SignProcessor(VideoProcessorBase):
 
-    if results.multi_hand_landmarks:
-        hand_found = True
+    def __init__(self):
+        self._lock = threading.Lock()
+
+        self._hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            model_complexity=1,
+            min_detection_confidence=0.75,
+            min_tracking_confidence=0.75,
+        )
+
+        self._fc            = 0
+        self._history       = deque(maxlen=STABLE_FRAMES)
+        self._current_sign  = "-"
+        self._confidence    = 0.0
+        self._hand_visible  = False
+        self._sentence      = ""
+        self._last_time     = 0.0
+        self._sign_locked   = False
+        self._motion_seq    = []
+        self._no_hand_count = 0
+
+    # ---- public API ----
+
+    def get_state(self):
+        with self._lock:
+            return {
+                "sign":       self._current_sign,
+                "confidence": self._confidence,
+                "sentence":   self._sentence,
+                "hand":       self._hand_visible,
+            }
+
+    def clear_text(self):
+        with self._lock:
+            self._sentence = ""
+        self._reset_detection()
+
+    def delete_last(self):
+        with self._lock:
+            if self._sentence:
+                self._sentence = self._sentence[:-1]
+        self._sign_locked = False
+
+    def add_space(self):
+        with self._lock:
+            if self._sentence and not self._sentence.endswith(" "):
+                self._sentence += " "
+        self._sign_locked = False
+        self._history.clear()
+
+    def _reset_detection(self):
+        self._history.clear()
+        self._motion_seq.clear()
+        self._sign_locked = False
+
+    # ---- frame processing ----
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
+        img = cv2.resize(img, (640, 480))
+
+        self._fc += 1
+
+        # Process every 2nd frame for performance
+        if self._fc % 2 == 0:
+            self._process(img)
+
+        self._draw_overlay(img)
+        return frame.from_ndarray(img, format="bgr24")
+
+    def _process(self, img):
+        rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self._hands.process(rgb)
+
+        # ---- NO HAND ----
+        if not results.multi_hand_landmarks:
+            self._no_hand_count += 1
+            if self._no_hand_count >= NO_HAND_RESET:
+                self._history.clear()
+                self._motion_seq.clear()
+                self._sign_locked = False
+                with self._lock:
+                    self._hand_visible = False
+                    self._current_sign = "-"
+                    self._confidence   = 0.0
+            return
+
+        # ---- HAND DETECTED ----
+        self._no_hand_count = 0
         hand = results.multi_hand_landmarks[0]
 
         # Draw skeleton
         mp_draw.draw_landmarks(
-            img_bgr, hand, mp_hands.HAND_CONNECTIONS,
+            img, hand, mp_hands.HAND_CONNECTIONS,
             mp_style.get_default_hand_landmarks_style(),
             mp_style.get_default_hand_connections_style(),
         )
 
+        with self._lock:
+            self._hand_visible = True
+
         # Static features
         row = extract_static_features(hand)
-        if row and sign_model:
+        if row is None:
+            return   # hand too small / false positive
+
+        # Motion features
+        motion_row = extract_motion_row(hand)
+        self._motion_seq.append(motion_row)
+        if len(self._motion_seq) > MOTION_LEN:
+            self._motion_seq.pop(0)
+
+        # ---- STATIC PREDICTION (A-Y) ----
+        prediction = ""
+        confidence = 0.0
+
+        if sign_model:
             try:
                 proba      = sign_model.predict_proba([row])[0]
                 confidence = float(max(proba)) * 100.0
@@ -182,21 +285,14 @@ def process_frame(img_bgr, hands_detector):
             except Exception:
                 pass
 
-        # Motion features (J/Z)
-        motion_row = extract_motion_row(hand)
-        st.session_state["motion_seq"].append(motion_row)
-        if len(st.session_state["motion_seq"]) > MOTION_LEN:
-            st.session_state["motion_seq"].pop(0)
-
+        # ---- MOTION PREDICTION (J/Z) ----
         if (
             motion_model
-            and len(st.session_state["motion_seq"]) == MOTION_LEN
+            and len(self._motion_seq) == MOTION_LEN
+            and self._fc % 6 == 0
         ):
             try:
-                feat    = np.array(
-                    st.session_state["motion_seq"],
-                    dtype=np.float32
-                ).reshape(1, -1)
+                feat    = np.array(self._motion_seq, dtype=np.float32).reshape(1, -1)
                 m_proba = motion_model.predict_proba(feat)[0]
                 m_conf  = float(max(m_proba)) * 100.0
                 m_label = str(motion_model.predict(feat)[0]).upper()
@@ -206,66 +302,61 @@ def process_frame(img_bgr, hands_detector):
             except Exception:
                 pass
 
-        # Stability buffer
+        # ---- STABILITY BUFFER ----
         if prediction:
-            st.session_state["history"].append(prediction)
+            self._history.append(prediction)
 
         stable_sign = None
-        hist = st.session_state["history"]
-        if len(hist) >= STABLE_FRAMES:
-            top_sign, top_count = Counter(hist).most_common(1)[0]
+        if len(self._history) == STABLE_FRAMES:
+            top_sign, top_count = Counter(self._history).most_common(1)[0]
             if top_count >= STABLE_MAJORITY:
                 stable_sign = top_sign
 
-        if stable_sign:
-            st.session_state["last_sign"] = stable_sign
-            st.session_state["last_conf"] = confidence
+        with self._lock:
+            if stable_sign:
+                self._current_sign = stable_sign
+                self._confidence   = confidence
+            elif not prediction:
+                self._current_sign = "..."
+                self._confidence   = 0.0
 
-            # Commit letter
-            now = time.time()
-            if (
-                not st.session_state["sign_locked"]
-                and (now - st.session_state["last_letter_time"]) >= LETTER_DELAY
-                and confidence >= MIN_CONFIDENCE
-            ):
-                st.session_state["sentence"]         += stable_sign
-                st.session_state["last_letter_time"]  = now
-                st.session_state["sign_locked"]       = True
-                st.session_state["history"]           = deque(maxlen=STABLE_FRAMES)
-                if stable_sign in ("J", "Z"):
-                    st.session_state["motion_seq"] = []
+        # ---- COMMIT LETTER ----
+        now = time.time()
+        if (
+            stable_sign is not None
+            and not self._sign_locked
+            and (now - self._last_time) >= LETTER_DELAY
+            and confidence >= MIN_CONFIDENCE
+        ):
+            with self._lock:
+                self._sentence += stable_sign
+            self._last_time   = now
+            self._sign_locked = True
+            self._history.clear()
+            if stable_sign in ("J", "Z"):
+                self._motion_seq.clear()
 
-        prediction = st.session_state["last_sign"]
-        confidence = st.session_state["last_conf"]
+    def _draw_overlay(self, img):
+        with self._lock:
+            sign = self._current_sign
+            conf = self._confidence
+            hand = self._hand_visible
 
-    else:
-        # No hand
-        st.session_state["no_hand_count"] += 1
-        if st.session_state["no_hand_count"] >= 3:
-            st.session_state["history"]      = deque(maxlen=STABLE_FRAMES)
-            st.session_state["motion_seq"]   = []
-            st.session_state["sign_locked"]  = False
-            st.session_state["last_sign"]    = "-"
-            st.session_state["last_conf"]    = 0.0
-            st.session_state["no_hand_count"] = 0
+        if hand and sign not in ("-", "..."):
+            text  = f"SIGN: {sign}  ({conf:.0f}%)"
+            color = (0, 220, 80)
+        elif hand:
+            text  = "Detecting..."
+            color = (0, 200, 255)
+        else:
+            text  = "No hand detected"
+            color = (0, 80, 255)
 
-    # Overlay text on frame
-    if hand_found and prediction not in ("-", ""):
-        text  = f"SIGN: {prediction}  ({confidence:.0f}%)"
-        color = (0, 220, 80)
-    elif hand_found:
-        text  = "Detecting..."
-        color = (0, 200, 255)
-    else:
-        text  = "No hand detected"
-        color = (0, 80, 255)
-
-    cv2.putText(img_bgr, text, (15, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
-    cv2.putText(img_bgr, text, (15, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-
-    return img_bgr, prediction, confidence, hand_found
+        # Shadow + text for readability
+        cv2.putText(img, text, (15, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
+        cv2.putText(img, text, (15, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
 # =============================================
 # CSS
@@ -289,10 +380,7 @@ st.markdown("""
     font-size: 14px;
     margin-top: -4px;
 }
-.sign-box {
-    text-align: center;
-    padding: 8px 0 4px 0;
-}
+.sign-box { text-align: center; padding: 8px 0 4px 0; }
 .sign-letter {
     font-size: 120px;
     font-weight: 900;
@@ -332,12 +420,12 @@ with h1:
 st.divider()
 
 # =============================================
-# MODEL ERROR
+# MODEL ERRORS
 # =============================================
 
 if model_errors:
     for e in model_errors:
-        st.error(e)
+        st.error(f"⚠️ {e}")
     st.info("Run `python train_model.py` first, then restart the app.")
     st.stop()
 
@@ -347,55 +435,49 @@ if model_errors:
 
 cam_col, panel_col = st.columns([1.1, 0.9], gap="large")
 
-# =============================================
-# LEFT: CAMERA via st.camera_input
-# Works on ALL devices and Streamlit Cloud
-# No WebRTC, no STUN/TURN needed
-# =============================================
-
+# ---- LEFT: Live Camera ----
 with cam_col:
     st.subheader("📷 Live Camera")
-    st.caption("Click **Take Photo** → hold your sign → it will be recognised instantly.")
 
-    # st.camera_input works on every browser and Streamlit Cloud
-    camera_image = st.camera_input(
-        label="camera",
-        label_visibility="collapsed",
+    ctx = webrtc_streamer(
+        key="signify-live",
+        video_processor_factory=SignProcessor,
+        rtc_configuration=RTC_CONFIG,
+        media_stream_constraints={
+            "video": {
+                "width":     {"ideal": 640},
+                "height":    {"ideal": 480},
+                "frameRate": {"ideal": 24},
+            },
+            "audio": False,
+        },
+        async_processing=True,
+        translations={
+            "start": "▶ Start Camera",
+            "stop":  "⏹ Stop Camera",
+            "select_device": "Select Camera",
+        },
     )
 
-    hands_detector = get_hands_detector()
-
-    if camera_image is not None:
-        # Convert uploaded snapshot to numpy BGR
-        pil_img  = Image.open(camera_image)
-        img_rgb  = np.array(pil_img)
-        img_bgr  = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-
-        # Process frame
-        annotated, sign, conf, hand = process_frame(img_bgr, hands_detector)
-
-        # Show annotated frame
-        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        st.image(annotated_rgb, use_container_width=True)
-
-    else:
-        st.info("👆 Click the camera button above to take a photo of your sign.")
-
-# =============================================
-# RIGHT: Info panel
-# =============================================
-
+# ---- RIGHT: Info panel ----
 with panel_col:
     st.subheader("🔎 Detected Sign")
 
-    sign = st.session_state["last_sign"]
-    conf = st.session_state["last_conf"]
-    sent = st.session_state["sentence"]
+    processor = ctx.video_processor if ctx else None
 
-    # Big letter display
-    if sign not in ("-", "...","") and conf >= MIN_CONFIDENCE:
+    if processor:
+        state = processor.get_state()
+        sign  = state["sign"]
+        conf  = state["confidence"]
+        sent  = state["sentence"]
+        hand  = state["hand"]
+    else:
+        sign, conf, sent, hand = "-", 0.0, "", False
+
+    # Big letter
+    if hand and sign not in ("-", "..."):
         css_class = "active"
-    elif camera_image is not None:
+    elif hand:
         css_class = "wait"
     else:
         css_class = "nohand"
@@ -408,12 +490,12 @@ with panel_col:
     )
 
     # Status
-    if sign not in ("-", "...", "") and conf >= MIN_CONFIDENCE:
+    if hand and sign not in ("-", "..."):
         st.success(f"✅ Recognised  •  Confidence: {conf:.1f}%")
-    elif camera_image is not None:
-        st.warning("👋 Hand detected — hold sign steady and retake")
+    elif hand:
+        st.warning("👋 Hand visible — hold sign steady...")
     else:
-        st.info("📸 Take a photo to begin")
+        st.info("👋 Click START CAMERA then show your hand")
 
     st.markdown("---")
 
@@ -431,50 +513,38 @@ with panel_col:
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("🗑️ Clear", use_container_width=True):
-            st.session_state["sentence"]      = ""
-            st.session_state["history"]       = deque(maxlen=STABLE_FRAMES)
-            st.session_state["motion_seq"]    = []
-            st.session_state["sign_locked"]   = False
-            st.session_state["last_sign"]     = "-"
-            st.session_state["last_conf"]     = 0.0
-            st.rerun()
-
+            if processor:
+                processor.clear_text()
     with c2:
         if st.button("⌫ Backspace", use_container_width=True):
-            if st.session_state["sentence"]:
-                st.session_state["sentence"] = st.session_state["sentence"][:-1]
-            st.session_state["sign_locked"] = False
-            st.rerun()
-
+            if processor:
+                processor.delete_last()
     with c3:
         if st.button("␣  Space", use_container_width=True):
-            s = st.session_state["sentence"]
-            if s and not s.endswith(" "):
-                st.session_state["sentence"] += " "
-            st.session_state["sign_locked"] = False
-            st.rerun()
+            if processor:
+                processor.add_space()
 
     st.markdown("---")
 
     with st.expander("ℹ️ How to use"):
-        st.markdown("""
-**How to sign a letter:**
-1. Position your hand clearly in the camera frame
-2. Make the ASL sign
-3. Click **Take Photo** (the camera button)
-4. The letter appears automatically if confidence ≥ 70%
-5. Remove your hand, then repeat for the next letter
+        st.markdown(f"""
+**Steps:**
+1. Click **▶ Start Camera**
+2. Allow browser camera permission
+3. Hold an ASL sign clearly in frame
+4. Letter appears when confidence ≥ {MIN_CONFIDENCE}%
+5. Remove hand between letters to unlock next letter
 
-**Tips:**
-- Good lighting = better accuracy
-- Keep hand fully in frame, avoid busy backgrounds
-- Hold sign steady when taking the photo
-- Use **Backspace** to fix mistakes
-
-**Buttons:**
-- 🗑️ **Clear** — erase everything
+**Controls:**
+- 🗑️ **Clear** — erase all text
 - ⌫ **Backspace** — delete last letter
 - ␣ **Space** — add space between words
+
+**Tips for accuracy:**
+- Good lighting is important
+- Keep hand fully in frame
+- Avoid busy/dark backgrounds
+- Hold sign still for ~{LETTER_DELAY} seconds
         """)
 
     st.caption(
@@ -482,6 +552,11 @@ with panel_col:
         f"Stability: {STABLE_FRAMES} frames • "
         f"Letter delay: {LETTER_DELAY}s"
     )
+
+    # Auto-refresh
+    if processor:
+        time.sleep(0.35)
+        st.rerun()
 
 # =============================================
 # FOOTER
