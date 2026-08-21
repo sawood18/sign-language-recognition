@@ -1,4 +1,0 @@
-[tool.uv]
-override-dependencies = [
-    "opencv-contrib-python==4.10.0.84",
-]
